@@ -1,0 +1,129 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on the Go
+# project's own TryBot/LUCI infrastructure), so this workflow is written from
+# scratch. It packages the module zip exactly as the module proxy does and runs
+# the project's own test suite (`go test ./...`) on Linux, macOS and Windows.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated Go test names to run instead of the full suite'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      # Build the packaging helper in its own module OUTSIDE the checkout, so
+      # `go get` never touches this repository's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      # golang.org/x/mod/zip skips .git but DESCENDS into .github, so this
+      # workflow would otherwise leak into the zip as extra entries that the
+      # public proxy artifact does not have. .gitignore and .gitattributes are
+      # kept: they ARE part of the published module zip.
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/net v0.45.0 \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        # Windows would otherwise default to pwsh, where `set -eux` fails.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+
+      # `go test -json` (which implies -v) records every test event; the
+      # verbose text output is rendered back into the log as it streams, and
+      # test.json feeds the summary step, which pairs each skipped test with
+      # its own t.Skip message even when parallel tests interleave.
+      # A non-empty test-filter runs only the named tests, anchored so
+      # "TestFoo" does not also match TestFooBar.
+      - name: Test
+        run: |
+          set -euxo pipefail
+          FILTER="${{ inputs.test-filter }}"
+          RUN_ARGS=()
+          if [ -n "$FILTER" ]; then
+            RUN_ARGS=(-run "^($(echo "$FILTER" | tr ' ' '|'))$")
+          fi
+          # ${arr[@]+...} keeps an empty array safe under set -u on macOS's bash 3.2.
+          go test -json ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} ./... \
+            | tee "$RUNNER_TEMP/test.json" \
+            | jq -j --unbuffered 'select(.Action == "output") | .Output' \
+            | tee "$RUNNER_TEMP/test.log"
+          for t in $FILTER; do
+            grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/test.log" || { echo "selected test $t did not run"; exit 1; }
+          done
+
+      - name: Test summary
+        if: always()
+        run: |
+          set -eu
+          JSON="$RUNNER_TEMP/test.json"
+          jq -s -r '
+            [.[] | select(.Test == null and (.Action == "pass" or .Action == "fail"))] as $pkgs
+            | [.[] | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))] as $tests
+            | "packages ok: \([$pkgs[] | select(.Action == "pass")] | length), packages FAIL: \([$pkgs[] | select(.Action == "fail")] | length)",
+              "tests passed: \([$tests[] | select(.Action == "pass")] | length), tests failed: \([$tests[] | select(.Action == "fail")] | length), tests skipped: \([$tests[] | select(.Action == "skip")] | length)"
+          ' "$JSON"
+          echo "Skipped tests with reasons:"
+          jq -s -r '
+            group_by([.Package, .Test // ""])[]
+            | select(.[0].Test != null and any(.[]; .Action == "skip"))
+            | "SKIP \(.[0].Package) \(.[0].Test): "
+              + ([.[] | select(.Action == "output") | .Output
+                  | select(test("^\\s*(=== |--- )") | not)
+                  | gsub("^\\s+|\\s+$"; "")
+                  | select(length > 0)] | join(" | "))
+          ' "$JSON"
